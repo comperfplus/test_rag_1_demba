@@ -15,7 +15,29 @@ import streamlit as st
 import numpy as np
 import tiktoken
 import torch
+import shutil
+import subprocess
 from openai import OpenAI
+
+# Make FFmpeg discoverable by Transformers even when only imageio-ffmpeg is available.
+try:
+    import imageio_ffmpeg
+    _ffmpeg_binary = Path(imageio_ffmpeg.get_ffmpeg_exe())
+    _ffmpeg_bin_dir = Path(tempfile.gettempdir()) / "ffmpeg-bin"
+    _ffmpeg_bin_dir.mkdir(parents=True, exist_ok=True)
+    _ffmpeg_alias = _ffmpeg_bin_dir / "ffmpeg"
+    if not _ffmpeg_alias.exists():
+        try:
+            _ffmpeg_alias.symlink_to(_ffmpeg_binary)
+        except Exception:
+            shutil.copy2(_ffmpeg_binary, _ffmpeg_alias)
+            _ffmpeg_alias.chmod(0o755)
+    os.environ["PATH"] = str(_ffmpeg_bin_dir) + os.pathsep + os.environ.get("PATH", "")
+    logger = logging.getLogger("vocal_rag")
+    logger.info("FFmpeg disponible : %s", shutil.which("ffmpeg"))
+except Exception:
+    logging.getLogger("vocal_rag").exception("Impossible de configurer FFmpeg depuis imageio-ffmpeg")
+
 from PyPDF2 import PdfReader
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, pipeline
 
