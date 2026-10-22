@@ -1,71 +1,76 @@
 """
 Assistant vocal wolof + RAG sur documents PDF.
-Lancer avec : python app.py
-Les documents PDF doivent être placés dans ./folder_rag/
-La clé OpenAI doit être définie dans un fichier .env ou dans l'environnement.
+Déploiement Streamlit Cloud : définir OPENAI_API_KEY dans Settings > Secrets.
+Déposer les PDF dans folder_rag/.
 """
-
-import spaces
-
 import os
 import logging
+import tempfile
 from pathlib import Path
 from typing import List, Tuple
 import itertools as it
 import operator as op
 
-import gradio as gr
+import streamlit as st
 import numpy as np
 import tiktoken
 import torch
-from dotenv import load_dotenv
 from openai import OpenAI
 from PyPDF2 import PdfReader
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, pipeline
 
-# ---------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent
 PDF_DIR = BASE_DIR / "folder_rag"
-load_dotenv(BASE_DIR / ".env")
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("vocal_rag")
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+st.set_page_config(page_title="Assistant vocal wolof — RAG RGPH", page_icon="🗣️", layout="wide")
+st.title("🗣️ Assistant vocal wolof — RAG sur les documents PDF")
+st.write(
+    "Enregistrez une question en wolof ou importez un fichier audio. "
+    "L’application transcrit la question, la traduit en français, recherche dans les PDF, "
+    "puis traduit la réponse en wolof."
+)
+
+# Streamlit Cloud: configure OPENAI_API_KEY under App settings > Secrets.
+def get_api_key():
+    key = None
+    try:
+        key = st.secrets.get("OPENAI_API_KEY")
+    except Exception:
+        pass
+    return key or os.getenv("OPENAI_API_KEY")
+
+OPENAI_API_KEY = get_api_key()
 if not OPENAI_API_KEY:
-    raise RuntimeError(
-        "OPENAI_API_KEY est manquante. Crée un fichier .env à côté de app.py "
-        "et ajoute : OPENAI_API_KEY=ta_cle_api"
-    )
+    st.error("La clé OPENAI_API_KEY est absente. Dans Streamlit Cloud, ouvre Settings > Secrets et ajoute : OPENAI_API_KEY = \"ta_cle_api\"")
+    st.stop()
 
 client = OpenAI(api_key=OPENAI_API_KEY)
-
 EMBEDDING_MODEL = "text-embedding-3-small"
 LLM_MODEL = "gpt-4o-mini"
 CHUNK_SIZE = 512
 TOP_K = 5
-
 TRANSLATION_CHECKPOINT = "galsenai/wolofToFrenchTranslator_nllb"
 ASR_CHECKPOINT = "abdouaziz/wolof_wlarge"
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-logger.info("Périphérique de calcul : %s", device)
+@st.cache_resource(show_spinner="Chargement du modèle de traduction wolof/français…")
+def load_translation_model():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    tokenizer = AutoTokenizer.from_pretrained(TRANSLATION_CHECKPOINT)
+    model = AutoModelForSeq2SeqLM.from_pretrained(TRANSLATION_CHECKPOINT).to(device)
+    model.eval()
+    return tokenizer, model, device
 
-# ---------------------------------------------------------------------
-# Modèle de traduction Wolof <-> Français
-# ---------------------------------------------------------------------
-logger.info("Chargement du modèle de traduction : %s", TRANSLATION_CHECKPOINT)
-translation_tokenizer = AutoTokenizer.from_pretrained(TRANSLATION_CHECKPOINT)
-translation_model = AutoModelForSeq2SeqLM.from_pretrained(
-    TRANSLATION_CHECKPOINT
-).to(device)
-translation_model.eval()
- 
+@st.cache_resource(show_spinner="Chargement du modèle de reconnaissance vocale…")
+def load_asr():
+    return pipeline(
+        "automatic-speech-recognition",
+        model=ASR_CHECKPOINT,
+        device=0 if torch.cuda.is_available() else -1,
+    )
 
-def translator(text: str, lang: str = "wo") -> str:
-    """Traduit du wolof vers le français (wo) ou du français vers le wolof (fr)."""
+def translator(text: str, lang: str, tokenizer, model, device) -> str:
     if not text or not text.strip():
         return ""
     if lang.lower() == "wo":
@@ -74,25 +79,14 @@ def translator(text: str, lang: str = "wo") -> str:
         prefix = "translate French to Wolof: "
     else:
         raise ValueError("Le paramètre lang doit être 'wo' ou 'fr'.")
-
-    inputs = translation_tokenizer(prefix + text, return_tensors="pt").to(device)
+    inputs = tokenizer(prefix + text, return_tensors="pt").to(device)
     with torch.inference_mode():
-        translated_tokens = translation_model.generate(**inputs, max_length=230)
-    return translation_tokenizer.batch_decode(
-        translated_tokens, skip_special_tokens=True
-    )[0]
+        translated_tokens = model.generate(**inputs, max_length=230)
+    return tokenizer.batch_decode(translated_tokens, skip_special_tokens=True)[0]
 
-
-# ---------------------------------------------------------------------
-# RAG : lecture des PDF, découpage, embeddings et recherche
-# ---------------------------------------------------------------------
 def load_pdf_pages(file_path: Path) -> List[str]:
     reader = PdfReader(str(file_path))
-    pages = []
-    for page in reader.pages:
-        pages.append(page.extract_text() or "")
-    return pages
-
+    return [(page.extract_text() or "") for page in reader.pages]
 
 def chunk_pages(pages: List[str], chunk_size: int = CHUNK_SIZE) -> List[str]:
     encoding = tiktoken.encoding_for_model("gpt-3.5-turbo")
@@ -101,257 +95,131 @@ def chunk_pages(pages: List[str], chunk_size: int = CHUNK_SIZE) -> List[str]:
     ))
     if not tokens:
         return []
-    number_of_chunks = max(1, int(np.ceil(len(tokens) / chunk_size)))
+    n_chunks = max(1, int(np.ceil(len(tokens) / chunk_size)))
     return [
         encoding.decode(list(part))
-        for part in np.array_split(np.asarray(tokens), number_of_chunks)
+        for part in np.array_split(np.asarray(tokens), n_chunks)
         if len(part) > 0
     ]
-
 
 def embed(texts: List[str]) -> np.ndarray:
     if not texts:
         return np.empty((0, 0), dtype=np.float32)
-    # Appel par lots pour éviter d'envoyer trop de textes en une seule requête.
     vectors = []
-    batch_size = 64
-    for start in range(0, len(texts), batch_size):
+    for start in range(0, len(texts), 64):
         response = client.embeddings.create(
-            input=texts[start:start + batch_size],
+            input=texts[start:start + 64],
             model=EMBEDDING_MODEL,
         )
         vectors.extend(item.embedding for item in response.data)
     return np.asarray(vectors, dtype=np.float32)
 
-
-def retrieve(
-    query_embedding: np.ndarray,
-    chunks: List[str],
-    chunk_embeddings: np.ndarray,
-    top_k: int = TOP_K,
-) -> List[str]:
+def retrieve(query_embedding: np.ndarray, chunks: List[str], chunk_embeddings: np.ndarray, top_k: int = TOP_K) -> List[str]:
     if not chunks or chunk_embeddings.size == 0:
         return []
-    denominator = (
-        np.linalg.norm(chunk_embeddings, axis=1)
-        * np.linalg.norm(query_embedding)
-    )
+    denominator = np.linalg.norm(chunk_embeddings, axis=1) * np.linalg.norm(query_embedding)
     denominator = np.where(denominator == 0, 1e-12, denominator)
     scores = np.dot(chunk_embeddings, query_embedding) / denominator
     ranked = sorted(zip(chunks, scores), key=op.itemgetter(1), reverse=True)
     return [chunk for chunk, _ in ranked[:top_k]]
 
-
 def ask(query: str, context_chunks: List[str]) -> str:
     context = "\n".join(f"- {chunk}" for chunk in context_chunks)
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "Tu es un assistant qui répond aux questions en se basant sur le "
-                "contexte fourni, extrait des documents. Réponds clairement, "
-                "naturellement et directement. Si le contexte ne contient pas la "
-                "réponse, indique que l'information ne figure pas dans les documents "
-                "et ne l'invente pas."
-            ),
-        },
-        {
-            "role": "user",
-            "content": f"Contexte :\n{context}\n\nQuestion : {query}",
-        },
-    ]
     completion = client.chat.completions.create(
         model=LLM_MODEL,
-        messages=messages,
+        messages=[
+            {"role": "system", "content":
+             "Tu es un assistant qui répond aux questions en se basant sur le contexte fourni, extrait des documents. "
+             "Réponds clairement, naturellement et directement. Si le contexte ne contient pas la réponse, "
+             "indique que l'information ne figure pas dans les documents et ne l'invente pas."},
+            {"role": "user", "content": f"Contexte :\n{context}\n\nQuestion : {query}"},
+        ],
         temperature=0,
     )
-    return completion.choices[0].message.content.strip()
+    return (completion.choices[0].message.content or "").strip()
 
-
-def build_corpus(pdf_dir: Path) -> Tuple[List[str], np.ndarray]:
-    pdf_files = sorted(pdf_dir.rglob("*.pdf"))
-    if not pdf_files:
-        raise FileNotFoundError(
-            f"Aucun PDF trouvé dans {pdf_dir}. Ajoute tes documents PDF dans ce dossier."
-        )
-
+@st.cache_resource(show_spinner="Lecture des PDF et indexation du corpus RAG…")
+def build_corpus(pdf_paths: Tuple[str, ...], api_key: str):
+    # Use an API client bound to the configured key in this cached operation.
+    local_client = OpenAI(api_key=api_key)
     all_chunks = []
-    for pdf_file in pdf_files:
-        logger.info("Lecture du PDF : %s", pdf_file.name)
+    for file_name in pdf_paths:
+        pdf_file = Path(file_name)
         try:
             pages = load_pdf_pages(pdf_file)
-            file_chunks = chunk_pages(pages)
-            all_chunks.extend(file_chunks)
-            logger.info("  %d segments extraits", len(file_chunks))
+            all_chunks.extend(chunk_pages(pages))
         except Exception:
-        # Un document problématique ne doit pas empêcher les autres d'être lus.
-            logger.exception("Impossible de traiter %s", pdf_file)
+            logger.exception("Impossible de traiter %s", pdf_file.name)
     if not all_chunks:
-        raise ValueError(
-            "Aucun texte exploitable n'a été extrait des PDF. "
-            "Vérifie qu'ils contiennent du texte et ne sont pas uniquement scannés."
-        )
-    logger.info("Calcul des embeddings pour %d segments...", len(all_chunks))
-    return all_chunks, embed(all_chunks)
+        raise ValueError("Aucun texte exploitable n’a été extrait des PDF. Vérifiez que les fichiers ne sont pas uniquement scannés.")
+    vectors = []
+    for start in range(0, len(all_chunks), 64):
+        response = local_client.embeddings.create(input=all_chunks[start:start + 64], model=EMBEDDING_MODEL)
+        vectors.extend(item.embedding for item in response.data)
+    return all_chunks, np.asarray(vectors, dtype=np.float32)
 
+pdf_files = tuple(str(p) for p in sorted(PDF_DIR.rglob("*.pdf"))) if PDF_DIR.exists() else tuple()
+if not pdf_files:
+    st.error(f"Aucun PDF trouvé dans `{PDF_DIR}`. Ajoutez les documents dans le dossier `folder_rag/` du dépôt GitHub.")
+    st.stop()
 
-logger.info("Construction de la base documentaire depuis %s", PDF_DIR)
-corpus_chunks, corpus_embeddings = build_corpus(PDF_DIR)
-logger.info("Base RAG prête : %d segments", len(corpus_chunks))
+try:
+    with st.spinner("Préparation des modèles et des documents…"):
+        tokenizer, translation_model, device = load_translation_model()
+        asr = load_asr()
+        corpus_chunks, corpus_embeddings = build_corpus(pdf_files, OPENAI_API_KEY)
+except Exception as exc:
+    logger.exception("Erreur pendant l'initialisation")
+    st.error("L’application n’a pas pu charger les modèles ou les documents.")
+    st.code(f"{type(exc).__name__}: {exc}")
+    st.info("Consultez les logs Streamlit Cloud pour le détail. Vérifiez aussi la mémoire disponible et la clé OpenAI.")
+    st.stop()
 
+audio_file = st.audio_input("Enregistrez votre question en wolof")
+uploaded_file = st.file_uploader("Ou importez un fichier audio", type=["wav", "mp3", "m4a", "ogg", "flac"])
 
-def get_response_from_llm(question: str) -> str:
-    query_embedding = embed([question])[0]
-    top_chunks = retrieve(query_embedding, corpus_chunks, corpus_embeddings)
-    if not top_chunks:
-        return "Je n'ai trouvé aucun passage exploitable dans les documents."
-    return ask(question, top_chunks)
-
-
-# ---------------------------------------------------------------------
-# Reconnaissance vocale (ASR)
-# ---------------------------------------------------------------------
-logger.info("Chargement du modèle de reconnaissance vocale : %s", ASR_CHECKPOINT)
-asr = pipeline(
-    "automatic-speech-recognition",
-    model=ASR_CHECKPOINT,
-    device=0 if torch.cuda.is_available() else -1,
-)
-
-@spaces.GPU(duration=120)
-def audio_to_text(audio_path):
-    if audio_path is None:
-        return "", "", "", "Veuillez enregistrer une question avec le microphone."
-
+audio_source = audio_file if audio_file is not None else uploaded_file
+if st.button("Traiter la question", type="primary", disabled=(audio_source is None)):
     try:
-        result = asr(audio_path)
-        transcription = result.get("text", "").strip()
-        if not transcription:
-            return "", "", "", "Je n'ai pas réussi à transcrire l'audio."
+        audio_bytes = audio_source.getvalue()
+        suffix = Path(getattr(audio_source, "name", "question.wav")).suffix or ".wav"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(audio_bytes)
+            audio_path = tmp.name
+        try:
+            with st.spinner("Transcription de l’audio…"):
+                result = asr(audio_path)
+            transcription = (result.get("text") or "").strip()
+            if not transcription:
+                st.warning("Je n’ai pas réussi à transcrire l’audio. Essayez un enregistrement plus clair.")
+                st.stop()
 
-        traduction = translator(text=transcription, lang="wo")
-        llm_response = get_response_from_llm(traduction)
-        llm_reponse_wo = translator(text=llm_response, lang="fr")
+            with st.spinner("Traduction et recherche dans les documents…"):
+                traduction = translator(transcription, "wo", tokenizer, translation_model, device)
+                query_embedding = embed([traduction])[0]
+                top_chunks = retrieve(query_embedding, corpus_chunks, corpus_embeddings)
+                if not top_chunks:
+                    llm_response = "Je n’ai trouvé aucun passage exploitable dans les documents."
+                else:
+                    llm_response = ask(traduction, top_chunks)
+                llm_reponse_wo = translator(llm_response, "fr", tokenizer, translation_model, device)
 
-        return transcription, traduction, llm_response, llm_reponse_wo
+            st.subheader("Résultats")
+            col1, col2 = st.columns(2)
+            with col1:
+                st.text_area("Transcription wolof", transcription, height=130)
+            with col2:
+                st.text_area("Traduction française de la question", traduction, height=130)
+            col3, col4 = st.columns(2)
+            with col3:
+                st.text_area("Réponse du chatbot en français", llm_response, height=200)
+            with col4:
+                st.text_area("Réponse du chatbot en wolof", llm_reponse_wo, height=200)
+        finally:
+            try:
+                os.unlink(audio_path)
+            except Exception:
+                pass
     except Exception as exc:
         logger.exception("Erreur pendant le traitement audio")
-        return "", "", "", f"Une erreur est survenue : {exc}"
-
-
-# ---------------------------------------------------------------------
-# Interface Gradio
-# ---------------------------------------------------------------------
-
-CUSTOM_CSS = """
-.gradio-container textarea,
-.gradio-container input {
-    border: 2px solid #2563eb !important;
-    border-radius: 10px !important;
-}
-
-.gradio-container textarea:focus,
-.gradio-container input:focus {
-    border-color: #111827 !important;
-    box-shadow: 0 0 0 1px #111827 !important;
-}
-
-.output-grid {
-    gap: 16px !important;
-}
-
-/* Deux derniers champs : contours verts */
-.gradio-container .output-grid:nth-of-type(2) textarea {
-    border: 2px solid #16a34a !important;
-    border-radius: 10px !important;
-}
-
-/* Contour vert foncé au focus */
-.gradio-container .output-grid:nth-of-type(2) textarea:focus {
-    border-color: #166534 !important;
-    box-shadow: 0 0 0 1px #166534 !important;
-}
-"""
-
-
-
-
-
-with gr.Blocks(
-    title="Assistant vocal Wolof - RAG RGPH",
-    css=CUSTOM_CSS + "\nfooter {visibility: hidden;}",
-) as demo:
-    gr.Markdown("# Assistant vocal wolof — RAG sur les documents PDF")
-    gr.Markdown(
-        "Posez votre question en wolof avec le microphone. "
-        "L'application transcrit la question, la traduit en français, "
-        "recherche dans les PDF, puis traduit la réponse en wolof."
-    )
-
-    with gr.Tab("Assistant vocal"):
-       # audio_input = gr.Audio(
-       #     sources=["microphone"],
-       #     type="filepath",
-       #     label="Enregistrer votre question en wolof",
-       # )
-
-
-        audio_input = gr.Audio(
-            sources=["microphone", "upload"],
-            type="filepath",
-            label="Enregistrez votre question ou importez un fichier audio",
-            format="wav",
-        )
-
-
-        submit_btn = gr.Button("Soumettre", variant="primary")
-        #transcription_output = gr.Textbox(label="Transcription wolof", lines=3)
-        #translation_output = gr.Textbox(label="Traduction française de la question", lines=3)
-        #answer_fr_output = gr.Textbox(label="Réponse du chatbot en français", lines=5)
-        #answer_wo_output = gr.Textbox(label="Réponse du chatbot en wolof", lines=5)
-        
-        with gr.Row(elem_classes=["output-grid"]):
-            transcription_output = gr.Textbox(
-                label="Transcription wolof",
-                lines=3,
-                elem_classes=["output-field"],
-            )
-            translation_output = gr.Textbox(
-                label="Traduction française de la question",
-                lines=3,
-                elem_classes=["output-field"],
-            )
-
-        with gr.Row(elem_classes=["output-grid", "response-green"]):
-            answer_fr_output = gr.Textbox(
-                label="Réponse du chatbot en français",
-                lines=5,
-                elem_classes=["output-field"],
-            )
-            answer_wo_output = gr.Textbox(
-                label="Réponse du chatbot en wolof",
-                lines=5,
-                elem_classes=["output-field"],
-            )
-
-
-
-
-        submit_btn.click(
-            fn=audio_to_text,
-            inputs=[audio_input],
-            outputs=[
-                transcription_output,
-                translation_output,
-                answer_fr_output,
-                answer_wo_output,
-            ],
-        )
-
-if __name__ == "__main__":
-    demo.launch(
-        debug=False,
-        #server_name="127.0.0.1",
-         server_name="0.0.0.0",
-        ssr_mode=False,
-    )
+        st.error(f"Une erreur est survenue pendant le traitement : {type(exc).__name__}: {exc}")

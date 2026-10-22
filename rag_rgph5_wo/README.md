@@ -1,26 +1,31 @@
-# Assistant vocal wolof + RAG (version locale)
+# Assistant vocal wolof + RAG (Streamlit Cloud)
 
-## Structure
-- `app.py` : application Gradio.
+Cette version est adaptée à **Streamlit Cloud** (et non à Gradio/Hugging Face Spaces).
+
+## Structure du dépôt
+- `app.py` : application Streamlit.
 - `requirements.txt` : dépendances Python.
-- `.env.example` : modèle de configuration de la clé OpenAI.
-- `folder_rag/` : déposer ici tous les PDF à indexer.
+- `folder_rag/` : placer ici les PDF à interroger.
 
-## Installation
-1. Installer Python 3.10 ou 3.11.
-2. Ouvrir un terminal dans ce dossier.
-3. Créer un environnement virtuel :
-   - Windows : `py -m venv .venv` puis `.venv\\Scripts\\activate`
-   - Linux/macOS : `python3 -m venv .venv` puis `source .venv/bin/activate`
-4. Installer les dépendances : `pip install -r requirements.txt`
-5. Copier `.env.example` vers `.env`, puis renseigner `OPENAI_API_KEY`.
-6. Copier tous les PDF dans `folder_rag/`.
-7. Lancer : `python app.py`
-8. Ouvrir l'adresse locale indiquée par Gradio, généralement `http://127.0.0.1:7860`.
+## Déploiement sur Streamlit Cloud
+1. Déposez ces fichiers dans votre dépôt GitHub.
+2. Placez les documents PDF dans `folder_rag/` et poussez-les sur GitHub.
+3. Dans Streamlit Cloud, choisissez le dépôt et le fichier principal `app.py`.
+4. Dans **App settings > Secrets**, ajoutez :
+   ```toml
+   OPENAI_API_KEY = "votre_cle_api"
+   ```
+5. Redémarrez l’application.
 
-## GPU
-Le code utilise CUDA si une version de PyTorch compatible GPU est installée et si un GPU NVIDIA est disponible. Sinon, il utilise le CPU, ce qui peut être très lent pour les modèles vocaux. Pour une installation GPU, installer PyTorch selon les instructions officielles correspondant à votre version de CUDA : https://pytorch.org/get-started/locally/
+## Fonctionnalités
+- Enregistrement audio via le navigateur ou import d’un fichier audio.
+- Transcription du wolof.
+- Traduction de la question en français.
+- Recherche RAG dans les PDF avec embeddings OpenAI.
+- Génération d’une réponse en français puis traduction en wolof.
 
-## Sécurité
-La clé OpenAI doit rester dans `.env` et ne doit jamais être publiée. Le dossier `.env` n'est pas inclus dans cette archive.
-Les PDF scannés sans couche texte nécessitent une étape OCR, non incluse ici.
+## Points d’attention
+- Le premier démarrage télécharge les modèles Hugging Face et peut être long.
+- Les modèles vocaux peuvent dépasser la mémoire disponible sur une instance Streamlit Cloud gratuite.
+- Les PDF scannés sans couche texte nécessitent une étape OCR.
+- Ne publiez jamais votre clé OpenAI dans GitHub.
