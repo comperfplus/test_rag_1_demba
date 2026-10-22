@@ -7,3 +7,4 @@ transformers>=4.40
 sentencepiece>=0.2
 accelerate>=0.30
 torch
+imageio-ffmpeg
